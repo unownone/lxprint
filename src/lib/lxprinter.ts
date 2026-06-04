@@ -62,6 +62,18 @@ export class LXPrinter extends Printer<LXPrinterStatus> {
   authCrc?: number[];
 
   printingImage?: BitmapData;
+  private resolvePrintStartAck?: () => void;
+  /** Flow-control credits from 0x5a 0x07 (typically 0x14 = 20 lines per grant). */
+  private flowCredits = 0;
+  private releaseFlowWait?: () => void;
+  /** True while print() is sending raster packets. */
+  private printTxActive = false;
+  private printAbortRequested = false;
+  /** True after all 0x55 lines and the end marker have been written. */
+  private printTxDone = false;
+  private pendingDoneMsg?: Uint8Array;
+  private resolvePrintDone?: () => void;
+  private doneAckSent = false;
 
   get driverName(): string {
     return "lx";
@@ -232,50 +244,207 @@ export class LXPrinter extends Printer<LXPrinterStatus> {
 
     switch (msg[1]) {
       case 0x01:
+        console.log("Auth Stage 1", msg.toHex());
         return await this.authStage1(msg);
       case 0x0a:
+        console.log("Auth Stage 2", msg.toHex());
         return await this.authStage2(msg);
       case 0x0b:
+        console.log("Auth Result", msg.toHex());
         return await this.authResult(msg);
       case 0x02:
+        console.log("Status", msg.toHex());
         return this.setStatus(parseStatusMsg(msg));
+      case 0x04:
+        return this.onPrintAck(msg);
       case 0x06:
+        console.log("Done Printing", msg.toHex());
         return await this.donePrinting(msg);
+      case 0x07:
+        return this.onFlowControl(msg);
+      default:
+        console.log("Unknown Message: ", msg.toHex());
     }
   }
 
+  private grantFlowCredits(count: number) {
+    this.flowCredits += count;
+    const release = this.releaseFlowWait;
+    this.releaseFlowWait = undefined;
+    release?.();
+  }
+
+  /** Pace TX when the printer grants credits; do not block forever if 0x07 stops. */
+  private async waitFlowCredit(): Promise<void> {
+    if (this.flowCredits > 0) {
+      this.flowCredits--;
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      const t = setTimeout(resolve, 75);
+      this.releaseFlowWait = () => {
+        clearTimeout(t);
+        resolve();
+      };
+    });
+    if (this.flowCredits > 0) {
+      this.flowCredits--;
+    }
+  }
+
+  /** Start-of-job ACK (0x5a 0x04 …, flags/code zero). End-of-job uses flags=0x01. */
+  onPrintAck(msg: Uint8Array) {
+    const dv = new DataView(msg.buffer);
+    const lineCount = dv.getUint16(2);
+    const flags = msg[4];
+    const code = msg[5];
+    console.log(
+      `Print ACK: lines=${lineCount} flags=0x${flags.toString(16)} code=0x${code.toString(16)}`,
+      msg.toHex(),
+    );
+    if (flags === 0 && code === 0) {
+      this.resolvePrintStartAck?.();
+      this.resolvePrintStartAck = undefined;
+    }
+  }
+
+  /** Buffer credits (byte 2 is often 0x14 = 20 lines) before sending raster data. */
+  onFlowControl(msg: Uint8Array) {
+    console.log(`Flow control credits=${msg[2]}`, msg.toHex());
+    this.grantFlowCredits(msg[2]);
+  }
+
+  /** 0x06 done: uint16 BE @2 = packet count; byte 4 often 0x01 when job finished. */
   async donePrinting(msg: Uint8Array) {
     const dv = new DataView(msg.buffer);
-    const printlen = dv.getUint16(2);
-
-    await this.sendChar?.writeValueWithoutResponse(
-      new Uint8Array([0x5a, 0x04, printlen >> 8, printlen & 0xff, 0x01, 0x00]),
+    const packetCount = dv.getUint16(2);
+    const status = msg[4];
+    console.log(
+      `Done Printing: packets=${packetCount} status=0x${status.toString(16)}`,
+      msg.toHex(),
     );
 
+    if (!this.printTxDone) {
+      console.log("Done received before TX complete — deferring ACK");
+      this.pendingDoneMsg = msg;
+      return;
+    }
+
+    await this.ackDonePrinting(msg);
+  }
+
+  async ackDonePrinting(msg: Uint8Array) {
+    if (this.doneAckSent) return;
+    this.doneAckSent = true;
+    const dv = new DataView(msg.buffer);
+    const packetCount = dv.getUint16(2);
+    await this.sendChar?.writeValueWithoutResponse(
+      new Uint8Array([
+        0x5a,
+        0x04,
+        packetCount >> 8,
+        packetCount & 0xff,
+        0x01,
+        0x00,
+      ]),
+    );
+    this.pendingDoneMsg = undefined;
+    this.resolvePrintDone?.();
+    this.resolvePrintDone = undefined;
     this.setStatus({ state: "connected" });
   }
 
+  private async waitForPrintDone(timeoutMs = 120_000): Promise<void> {
+    if (this.pendingDoneMsg) return;
+    await Promise.race([
+      new Promise<void>((resolve) => {
+        this.resolvePrintDone = resolve;
+      }),
+      new Promise<void>((_, reject) =>
+        setTimeout(() => reject(new Error("Print done timeout")), timeoutMs),
+      ),
+    ]);
+  }
+
+  cancelPrint(): void {
+    if (!this.printTxActive) return;
+    this.printAbortRequested = true;
+    const release = this.releaseFlowWait;
+    this.releaseFlowWait = undefined;
+    release?.();
+    this.resolvePrintStartAck?.();
+    this.resolvePrintStartAck = undefined;
+    this.resolvePrintDone?.();
+    this.resolvePrintDone = undefined;
+  }
+
   async print(img: ImageData) {
+    if (this.printTxActive) throw new Error("Print already in progress");
     this.setStatus({ state: "printing" });
 
     this.printingImage = new BitmapData(img);
+    this.printTxActive = true;
+    this.printAbortRequested = false;
+    this.printTxDone = false;
+    this.pendingDoneMsg = undefined;
+    this.doneAckSent = false;
+    this.flowCredits = 0;
 
+    const expectedPackets = this.printingImage.printLength;
     const msg = new Uint8Array(6);
     const dv = new DataView(msg.buffer);
     msg.set([0x5a, 0x04]);
-    dv.setUint16(2, this.printingImage.printLength + 1);
-    await this.sendChar?.writeValueWithoutResponse(msg);
+    dv.setUint16(2, expectedPackets + 1);
 
-    for (const line of this.printingImage.generatePrintData()) {
-      await this.sendChar?.writeValueWithoutResponse(line);
+    try {
+      const startAck = new Promise<void>((resolve) => {
+        this.resolvePrintStartAck = resolve;
+      });
+      await this.sendChar?.writeValueWithoutResponse(msg);
+      await Promise.race([
+        startAck,
+        new Promise<void>((_, reject) =>
+          setTimeout(() => reject(new Error("Print start ACK timeout")), 5000),
+        ),
+      ]);
+
+      for (const line of this.printingImage.generatePrintData()) {
+        if (this.printAbortRequested) break;
+        await this.waitFlowCredit();
+        if (this.printAbortRequested) break;
+        await this.sendChar?.writeValueWithoutResponse(line);
+      }
+
+      if (this.printAbortRequested) {
+        this.setStatus({ state: "connected" });
+        return;
+      }
+
+      const lastLine = new Uint8Array(100);
+      lastLine.set([
+        0x55,
+        expectedPackets >> 8,
+        expectedPackets & 0xff,
+      ]);
+      await this.waitFlowCredit();
+      await this.sendChar?.writeValueWithoutResponse(lastLine);
+
+      this.printTxDone = true;
+      if (this.pendingDoneMsg) {
+        await this.ackDonePrinting(this.pendingDoneMsg);
+      } else {
+        await this.waitForPrintDone();
+        if (this.pendingDoneMsg) {
+          await this.ackDonePrinting(this.pendingDoneMsg);
+        }
+      }
+    } finally {
+      this.printTxActive = false;
+      this.printTxDone = false;
+      this.printAbortRequested = false;
+      this.resolvePrintStartAck = undefined;
+      this.resolvePrintDone = undefined;
+      this.pendingDoneMsg = undefined;
     }
-
-    const lastLine = new Uint8Array(100);
-    lastLine.set([
-      0x55,
-      this.printingImage.printLength >> 8,
-      this.printingImage.printLength & 0xff,
-    ]);
-    await this.sendChar?.writeValueWithoutResponse(lastLine);
   }
 }

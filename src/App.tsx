@@ -1,20 +1,17 @@
-import './App.css'
-
-import { PrinterContextProvider } from './context.tsx';
-
-import Printer from './Printer'
-import { LabelMaker } from './Label'
+import { PrinterContextProvider } from "./context.tsx";
+import { AppShell } from "./components/layout/AppShell.tsx";
+import Printer from "./Printer.tsx";
+import { LabelMaker } from "./Label.tsx";
 
 function App() {
-
   return (
     <PrinterContextProvider>
-      <h1>Thermal Printer</h1>
-      <Printer />
-      <LabelMaker />
-      <div id='footer'><p>Version {__APP_VERSION__}+{__COMMIT_HASH__}</p></div>
+      <AppShell>
+        <Printer />
+        <LabelMaker />
+      </AppShell>
     </PrinterContextProvider>
-  )
+  );
 }
 
-export default App
+export default App;

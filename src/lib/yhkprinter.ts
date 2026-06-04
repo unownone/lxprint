@@ -103,10 +103,21 @@ export class YHKPrinter extends Printer<YHKPrinterStatus> {
     return UintToString(response);
   }
 
+  private printAbortRequested = false;
+
+  cancelPrint(): void {
+    this.printAbortRequested = true;
+    if (this.status.state === "printing") {
+      this.setStatus({ state: "connected" });
+    }
+  }
+
   async print(img: ImageData) {
     this.setStatus({ state: "printing" });
+    this.printAbortRequested = false;
 
     const printingImage = new BitmapData(img);
+    if (this.printAbortRequested) return;
 
     // Theoretically this sets the density
     await this.cmdWithoutResponse(new Uint8Array([0x1d, 0x49, 0xf0, 0x19]));
@@ -121,11 +132,17 @@ export class YHKPrinter extends Printer<YHKPrinterStatus> {
     dv.setUint16(6, img.height, true);
     await this.cmdWithoutResponse(header);
 
+    if (this.printAbortRequested) return;
+
     await this.cmdWithoutResponse(new Uint8Array(printingImage.bitmap));
+
+    if (this.printAbortRequested) return;
 
     // End Print code
     await this.cmdWithoutResponse(new Uint8Array([0x0a, 0x0a, 0x0a, 0x0a]));
 
-    this.setStatus({ state: "connected" });
+    if (!this.printAbortRequested) {
+      this.setStatus({ state: "connected" });
+    }
   }
 }
